@@ -1,9 +1,27 @@
 object FormMain: TFormMain
-  Left = 631
-  Height = 240
-  Top = 224
-  Width = 320
+  Left = 640
+  Height = 480
+  Top = 300
+  Width = 640
+  ActiveControl = OpenGLControlRender
   Caption = 'FormMain'
-  OnCreate = FormCreate
+  ClientHeight = 480
+  ClientWidth = 640
   LCLVersion = '2.0.6.0'
+  object OpenGLControlRender: TOpenGLControl
+    Left = 0
+    Height = 480
+    Top = 0
+    Width = 640
+    Align = alClient
+    AutoResizeViewport = True
+    MultiSampling = 4
+    OnClick = OpenGLControlRenderClick
+    OnKeyDown = OpenGLControlRenderKeyDown
+    OnKeyUp = OpenGLControlRenderKeyUp
+    OnMouseEnter = OpenGLControlRenderMouseEnter
+    OnMouseMove = OpenGLControlRenderMouseMove
+    OnPaint = OpenGLControlRenderDraw
+    OnResize = OpenGLControlRenderResize
+  end
 end
