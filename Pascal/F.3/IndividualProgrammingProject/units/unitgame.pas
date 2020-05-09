@@ -1070,7 +1070,7 @@ begin
 end;
 procedure Draw0(const Sender: TOpenGLControl);
 begin
-  if TryEnterCriticalsection(RTLCriticalSectionLoading) = 1 then
+  if not (TryEnterCriticalsection(RTLCriticalSectionLoading) = 0) then
   begin
     ProgressBar.Position:=100;
     TimeDeltaMills:=MSecsPerDay * (Now - TimeRenderedDay);
