@@ -1,4 +1,4 @@
-unit UnitWorld;
+unit UnitGame;
 
 {$mode objfpc}{$H+}
 {$modeSwitch AdvancedRecords}
@@ -6,8 +6,12 @@ unit UnitWorld;
 interface
 
 uses
-  Classes, SysUtils,
-  LCLType, OpenGLContext, Controls,
+  {$IFDEF UNIX}{$IFDEF UseCThreads}
+  cthreads,
+  cmem,
+  {$ENDIF}{$ENDIF}
+  Classes, SysUtils, Forms,
+  LCLType, OpenGLContext, Controls, StdCtrls, ComCtrls,
   fgl, Matrix, GL, GLU,
   UnitUtilities;
 
@@ -20,12 +24,12 @@ type
 
   TEnumFacing = (FacingUp, FacingDown, FacingNorth, FacingEast, FacingSouth, FacingWest);
   TSetEnumFacing = set of TEnumFacing;
-  TWorldDataRange = {$IFDEF Debug}0..16{$ELSE}0..64{$ENDIF};
+  TArrayGLLists = array of GLuint;
 
   { TGPosition }
 
   generic TGPosition<T> = class
-    private
+    protected
       fx: T;
       fy: T;
       fz: T;
@@ -76,14 +80,29 @@ type
 function CompareTFPGMapVisibleKey(const Left, Right: TFPGMapVisibleKey): Integer;
 
 type
-  TFPGMapVisible = specialize TFPGMap<TFPGMapVisibleKey, TSetEnumFacing>;
+  { TFPGMapVisibleValue }
+
+  TFPGMapVisibleValue = record
+    public
+      Facings: TSetEnumFacing;
+      function GetCallList: GLuint;
+      procedure SetCallList(const list: GLuint);
+    private
+      FGLList: GLuint;
+      FGLListExists: boolean;
+    public
+      property GLList: GLuint read GetCallList write SetCallList;
+      property GLListExists: boolean read FGLListExists;
+  end;
+
+  TFPGMapVisible = specialize TFPGMap<TFPGMapVisibleKey, TFPGMapVisibleValue>;
 
   { World }
 
   { TBlock }
 
   TBlock = class
-    private
+    protected
       FRenderer: TBlockRenderer;
     public
       constructor Create(const Renderer: TBlockRenderer = nil);
@@ -93,6 +112,9 @@ type
       function IsOpaque: boolean; virtual; abstract;
       destructor Destroy; override;
   end;
+  TArrayBlockColumn = array of TBlock;
+  TArrayBlockLayer = array of TArrayBlockColumn;
+  TArrayBlockCuboid = array of TArrayBlockLayer;
 
   { TBlockAir }
 
@@ -126,21 +148,24 @@ type
   TFunctionBlockForeachNeighbor = function(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock;
   TFunctionBlockForeachNeighborOfObject = function(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock of object;
   TWorld = class
-    private
+    protected
       FRenderer: TWorldRenderer;
+      FSize: Longint;
     public
-      constructor Create(const Renderer: TWorldRenderer = nil);
+      constructor Create(const Size: Longint; const Renderer: TWorldRenderer = nil);
       procedure SetRenderer(const Renderer: TWorldRenderer);
       property Renderer: TWorldRenderer read FRenderer write SetRenderer;
+      property Size: Longint read FSize;
+      function IsValidPosition(const Position: TPositionInteger): boolean; virtual;
       function GetBlock(const Position: TPositionInteger): TBlock; virtual;
       procedure SetBlock(const Position: TPositionInteger; const Block: TBlock); virtual;
       procedure ForeachBlock(const f: TFunctionWorldForeachBlock; const Arg: Pointer = nil); virtual; overload;
       procedure ForeachBlock(const f: TFunctionWorldForeachBlockOfObject; const Arg: Pointer = nil); virtual; overload;
       procedure ForeachNeighbor(const Position: TPositionInteger; const f: TFunctionBlockForeachNeighbor; const Arg: Pointer = nil); overload;
       procedure ForeachNeighbor(const Position: TPositionInteger; const f: TFunctionBlockForeachNeighborOfObject; const Arg: Pointer = nil); overload;
-    private
-      Data: array[TWorldDataRange, TWorldDataRange, TWorldDataRange] of TBlock;
-      function InitializeData(Block: TBlock; Position: TPositionInteger; Arg: Pointer): TBlock;
+    protected
+      Data: TArrayBlockCuboid;
+      function InitializeData(Block: TBlock; Position: TPositionInteger; Arg: Pointer): TBlock; virtual;
     public
       destructor Destroy; override;
   end;
@@ -152,7 +177,8 @@ type
   TCamera = class
     public
       fov, zNear, zFar: GLdouble;
-      constructor Create;
+      constructor Create(const World: TWorld = nil);
+      procedure SetWorld(const World: TWorld);
       procedure HandleRotateMouse(const Sender: TOpenGLControl; const Shift: TShiftState; const x, y: Integer);
       procedure HandleRotateKeyboard(const Sender: TOpenGLControl; const TimeDeltaMills: double);
       procedure UpdateRotation;
@@ -160,19 +186,21 @@ type
       procedure Render(const Sender: TOpenGLControl);
       function GetPosition: Tvector3_double;
       destructor Destroy; override;
-    private
+    protected
+      FWorld: TWorld;
       AxisX, AxisY, AxisZ: ^Tvector3_double;
       FPosition: ^Tvector3_double;
       Rotation: ^TQuaternionDouble;
       Front, Left, Up: ^Tvector3_double;
     public
       property Position: Tvector3_double read GetPosition;
+      property World: TWorld read FWorld write SetWorld;
   end;
 
   { TBlockRenderer }
 
   TBlockRenderer = class
-    private
+    protected
       FBlock: TBlock;
     public
       constructor Create(const Block: TBlock = nil);
@@ -219,10 +247,14 @@ type
   { TWorldRenderer }
 
   TWorldRenderer = class
-    private
+    protected
       FWorld: TWorld;
       VisibleOpaque: TFPGMapVisible;
       VisibleTranslucent: TFPGMapVisible;
+      GLListsOpaque: TArrayGLLists;
+      GLListsTranslucent: TArrayGLLists;
+      GLListsOpaqueReady: boolean;
+      GLListsTranslucentReady: boolean;
       function InitializeVisible(Block: TBlock; Position: TPositionInteger; Arg: Pointer): TBlock;
       function CheckNeighborBlockForVisible(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock;
     public
@@ -240,21 +272,32 @@ type
 
 { UnitWorld }
 
+procedure OnIdle0(const Sender: TOpenGLControl; var Done: boolean);
 procedure OnResize0(const Sender: TOpenGLControl);
 procedure Draw0(const Sender: TOpenGLControl);
+
+{ TApply0Parameters }
+
+type
+  TApply0Parameters = record
+    Sender: TOpenGLControl;
+    Size: Longint;
+  end;
+  PApply0Parameters = ^TApply0Parameters;
+
+procedure Apply1(const Sender: TOpenGLControl; const Size: Longint; const ProgressBarLoading: TProgressBar);
+function Apply0(Parameter: Pointer): PtrInt;
 procedure KeyDown0(const Sender: TOpenGLControl; var Key: Word; const Shift: TShiftState);
 procedure KeyUp0(const Sender: TOpenGLControl; var Key: Word; const Shift: TShiftState);
-procedure OnIdle0(const Sender: TOpenGLControl; var Done: boolean);
 procedure OnClick0(const Sender: TOpenGLControl);
 procedure OnMouseMove0(const Sender: TOpenGLControl; const Shift: TShiftState; const X, Y: Integer);
-procedure OnMouseLeave0(const Sender: TOpenGLControl);
+procedure OnExit0(const Sender: TOpenGLControl);
 
-procedure MouseCapture(const Sender: TOpenGLControl);
-procedure MouseUncapture(const Sender: TOpenGLControl);
+procedure MouseKeyboardCapture(const Sender: TOpenGLControl);
+procedure MouseKeyboardUncapture(const Sender: TOpenGLControl);
 
 const
   { World }
-  SetWorldDataRange = [Low(TWorldDataRange)..High(TWorldDataRange)];
   { Render }
   { Control }
   SetKeyRange = [Low(TKeyRange)..High(TKeyRange)];
@@ -263,16 +306,23 @@ const
   CameraRotationPerPixel = 90 / 800;
   CameraRotationPerMills = 90 / MSecsPerSec;
 
+var
+  TimeDeltaMills: double = -1;
+
 implementation
 
 var
+  ProgressBar: TProgressBar;
+  RTLCriticalSectionLoading: TRTLCriticalSection;
+
   RenderControlCenter: TPoint;
   TimeRenderedDay: TDateTime;
   KeysBeingPressed: TSetKey;
-  MouseCaptured: boolean = false;
+  MouseKeyboardCaptured: boolean = false;
 
   Model, Proj: T16dArray;
   View: TViewPortArray;
+
   ICamera: TCamera;
   IWorld: TWorld;
   IWorldRenderer: TWorldRenderer;
@@ -372,6 +422,20 @@ begin
   else { if Left > Right then } exit(1);
 end;
 
+{ TFPGMapVisibleValue }
+
+function TFPGMapVisibleValue.GetCallList: GLuint;
+begin
+  if not GLListExists then raise EAbort.Create(ResStringEIllegal);
+  exit(FGLList);
+end;
+procedure TFPGMapVisibleValue.SetCallList(const list: GLuint);
+begin
+  if GLListExists then glDeleteLists(GLList, 1);
+  FGLList:=list;
+  FGLListExists:=true;
+end;
+
 { TBlock }
 
 constructor TBlock.Create(const Renderer: TBlockRenderer = nil);
@@ -428,8 +492,20 @@ end;
 
 { TWorld }
 
-constructor TWorld.Create(const Renderer: TWorldRenderer = nil);
+constructor TWorld.Create(const Size: Longint; const Renderer: TWorldRenderer = nil);
+var
+  x, y: Integer;
 begin
+  FSize:=Size;
+  SetLength(Data, Size);
+  for x:=0 to Size - 1 do
+  begin
+    SetLength(Data[x], Size);
+    for y:=0 to Size - 1 do
+    begin
+      SetLength(Data[x][y], Size);
+    end;
+  end;
   ForeachBlock(@InitializeData);
   Self.Renderer:=Renderer;
 end;
@@ -447,32 +523,39 @@ begin
     else raise EAbort.Create(ResStringEUnexpected);
   end;
 end;
+function TWorld.IsValidPosition(const Position: TPositionInteger): boolean;
+begin
+  with Position do
+  begin
+    exit((x >= 0) and (x < Size) and (y >=0) and (y < Size) and (z >= 0) and (z < Size));
+  end;
+end;
 function TWorld.GetBlock(const Position: TPositionInteger): TBlock;
 begin
-  if (Position.x in SetWorldDataRange) and (Position.y in SetWorldDataRange) and (Position.z in SetWorldDataRange) then
+  if IsValidPosition(Position) then
   begin
-    exit(Data[Position.x][Position.z][Position.y]);
+    exit(Data[Position.x][Position.y][Position.z]);
   end
   else exit(nil);
 end;
 procedure TWorld.SetBlock(const Position: TPositionInteger; const Block: TBlock);
 begin
   if Block = nil then exit;
-  if (Position.x in SetWorldDataRange) and (Position.y in SetWorldDataRange) and (Position.z in SetWorldDataRange) then
+  if IsValidPosition(Position) then
   begin
-    Data[Position.x][Position.z][Position.y]:=Block;
+    Data[Position.x][Position.y][Position.z]:=Block;
   end;
 end;
 procedure TWorld.ForeachBlock(const f: TFunctionWorldForeachBlock; const Arg: Pointer = nil);
 var
-  x, y, z: TWorldDataRange;
+  x, y, z: Longint;
   Position: TPositionInteger;
 begin
-  for x in SetWorldDataRange do
+  for x:=0 to Size - 1 do
   begin
-    for z in SetWorldDataRange do
+    for y:=0 to Size - 1 do
     begin
-      for y in SetWorldDataRange do
+      for z:=0 to Size - 1 do
       begin
         Position:=TPositionInteger.Create(x, y, z);
         try
@@ -486,14 +569,14 @@ begin
 end;
 procedure TWorld.ForeachBlock(const f: TFunctionWorldForeachBlockOfObject; const Arg: Pointer = nil);
 var
-  x, y, z: TWorldDataRange;
+  x, y, z: Longint;
   Position: TPositionInteger;
 begin
-  for x in SetWorldDataRange do
+  for x:=0 to Size - 1 do
   begin
-    for z in SetWorldDataRange do
+    for y:=0 to Size - 1 do
     begin
-      for y in SetWorldDataRange do
+      for z:=0 to Size - 1 do
       begin
         Position:=TPositionInteger.Create(x, y, z);
         try
@@ -556,12 +639,8 @@ end;
 
 { TCamera }
 
-constructor TCamera.Create;
-var
-  WorldCenter: double;
+constructor TCamera.Create(const World: TWorld = nil);
 begin
-  WorldCenter:=(Low(TWorldDataRange) + High(TWorldDataRange)) / 2;
-
   New(AxisX, Init(1, 0, 0));
   New(AxisY, Init(0, 1, 0));
   New(AxisZ, Init(0, 0, 1));
@@ -570,7 +649,6 @@ begin
   zNear:=0.1;
   zFar:=1000;
 
-  New(FPosition, Init(WorldCenter, WorldCenter, High(TWorldDataRange) + 2));
   New(Rotation, InitAngleAxis(0, AxisX^));
   New(Front);
   Front^:=AxisX^;
@@ -578,6 +656,20 @@ begin
   Left^:=AxisY^;
   New(Up);
   Up^:=AxisZ^;
+
+  Self.World:=World;
+end;
+procedure TCamera.SetWorld(const World: TWorld);
+var
+  WorldCenter: double;
+begin
+  if (Self.World <> nil) and (World <> nil) then raise EAbort.Create(ResStringEIllegal);
+  FWorld:=World;
+  if Self.World <> nil then
+  begin
+    WorldCenter:=(0 + World.Size) / 2;
+    New(FPosition, Init(WorldCenter, WorldCenter, World.Size + 1));
+  end;
 end;
 function TCamera.GetPosition: Tvector3_double;
 begin
@@ -617,18 +709,24 @@ end;
 procedure TCamera.Move(const Sender: TOpenGLControl; const TimeDeltaMills: double);
 var
   CameraMovement: double;
+  PositionPrev: Tvector3_double;
 begin
   CameraMovement:=CameraMovementPerMills * TimeDeltaMills;
-  with TMatrixUtilities do
+  PositionPrev:=Position;
+  if VK_W in KeysBeingPressed then FPosition^:=Position + Front^ * CameraMovement;
+  if VK_S in KeysBeingPressed then FPosition^:=Position - Front^ * CameraMovement;
+  if VK_A in KeysBeingPressed then FPosition^:=Position + Left^ * CameraMovement;
+  if VK_D in KeysBeingPressed then FPosition^:=Position - Left^ * CameraMovement;
+  if VK_SPACE in KeysBeingPressed then FPosition^:=Position + Up^ * CameraMovement;
+  if VK_SHIFT in KeysBeingPressed then FPosition^:=Position - Up^ * CameraMovement;
+  if not (Position = PositionPrev) then
   begin
-    if VK_W in KeysBeingPressed then FPosition^:=Position + Front^ * CameraMovement;
-    if VK_S in KeysBeingPressed then FPosition^:=Position - Front^ * CameraMovement;
-    if VK_A in KeysBeingPressed then FPosition^:=Position + Left^ * CameraMovement;
-    if VK_D in KeysBeingPressed then FPosition^:=Position - Left^ * CameraMovement;
-    if VK_SPACE in KeysBeingPressed then FPosition^:=Position + Up^ * CameraMovement;
-    if VK_SHIFT in KeysBeingPressed then FPosition^:=Position - Up^ * CameraMovement;
+    with World.Renderer do
+    begin
+      VisibleTranslucent.Sorted:=false;
+      GLListsTranslucentReady:=false;
+    end;
   end;
-  IWorld.Renderer.VisibleTranslucent.Sorted:=false;
 end;
 procedure TCamera.Render(const Sender: TOpenGLControl);
 begin
@@ -800,55 +898,114 @@ begin
   if Self.World <> nil then Self.World.ForeachBlock(@InitializeVisible);
 end;
 function TWorldRenderer.InitializeVisible(Block: TBlock; Position: TPositionInteger; Arg: Pointer): TBlock;
-begin
-  World.ForeachNeighbor(Position, @CheckNeighborBlockForVisible);
-  exit(Block);
-end;
-function TWorldRenderer.CheckNeighborBlockForVisible(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock;
 var
   Visible: TFPGMapVisible;
   Key: TFPGMapVisibleKey;
   Index: Integer;
-  Facings: TSetEnumFacing;
+begin
+  if Block.IsOpaque then Visible:=VisibleOpaque
+  else Visible:=VisibleTranslucent;
+  Key.Value:=Position.Clone;
+  Index:=Visible.Add(Key);
+  Visible.Sorted:=false;
+  World.ForeachNeighbor(Position, @CheckNeighborBlockForVisible, @Index);
+  exit(Block);
+end;
+function TWorldRenderer.CheckNeighborBlockForVisible(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock;
+var
+  Index: PInteger;
+  Visible: TFPGMapVisible;
+  Value: TFPGMapVisibleValue;
 begin
   if (BlockTo = nil) or (not BlockTo.IsOpaque) then
   begin
+    Index:=PInteger(Arg);
     if BlockFrom.IsOpaque then Visible:=VisibleOpaque
     else Visible:=VisibleTranslucent;
-    Key.Value:=PositionFrom;
-    Index:=Visible.IndexOf(Key);
-    if Index = -1 then
-    begin
-      Key.Value:=Key.Value.Clone;
-      Index:=Visible.Add(Key);
-      Visible.Sorted:=false;
-    end
-    else Facings:=Visible.Data[Index];
-    Include(Facings, Facing);
-    Visible.Data[Index]:=Facings;
+    Value:=Visible.Data[Index^];
+    Include(Value.Facings, Facing);
+    Visible.Data[Index^]:=Value;
   end;
   exit(BlockTo);
 end;
 procedure TWorldRenderer.Render;
 var
   i: Integer;
+  Key: TFPGMapVisibleKey;
+  Value: TFPGMapVisibleValue;
 begin
   glEnable(GL_CULL_FACE);
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-  glBegin(GL_QUADS);
-  with VisibleOpaque do
+  if GLListsOpaqueReady then
   begin
-    for i:=0 to Count - 1 do World.GetBlock(Keys[i].Value).Renderer.Render(Keys[i].Value, Data[i]);
-  end;
-  VisibleTranslucent.Sorted:=true;
-  with VisibleTranslucent do
+    if not (Length(GLListsOpaque) = 0) then glCallLists(Length(GLListsOpaque), GL_UNSIGNED_INT, @GLListsOpaque[0]);
+  end
+  else
   begin
-    for i:=0 to Count - 1 do World.GetBlock(Keys[i].Value).Renderer.Render(Keys[i].Value, Data[i]);
+    with VisibleOpaque do
+    begin
+      SetLength(GLListsOpaque, Count);
+      for i:=0 to Count - 1 do
+      begin
+        Key:=Keys[i];
+        Value:=Data[i];
+        if Value.GLListExists then
+        begin
+          GLListsTranslucent[i]:=Value.GLList;
+          glCallList(Value.GLList);
+        end
+        else
+        begin
+          Value.GLList:=glGenLists(1);
+          GLListsOpaque[i]:=Value.GLList;
+          glNewList(Value.GLList, GL_COMPILE_AND_EXECUTE);
+          glBegin(GL_QUADS);
+            World.GetBlock(Key.Value).Renderer.Render(Key.Value, Value.Facings);
+          glEnd;
+          glEndList;
+          Data[i]:=Value;
+        end;
+      end;
+      GLListsOpaqueReady:=true;
+    end;
   end;
-  glEnd;
+  if GLListsTranslucentReady then
+  begin
+    if not (Length(GLListsTranslucent) = 0) then glCallLists(Length(GLListsTranslucent), GL_UNSIGNED_INT, @GLListsTranslucent[0]);
+  end
+  else
+  begin
+    VisibleTranslucent.Sorted:=true;
+    with VisibleTranslucent do
+    begin
+      SetLength(GLListsTranslucent, Count);
+      for i:=0 to Count - 1 do
+      begin
+        Key:=Keys[i];
+        Value:=Data[i];
+        if Value.GLListExists then
+        begin
+          GLListsTranslucent[i]:=Value.GLList;
+          glCallList(Value.GLList);
+        end
+        else
+        begin
+          Value.GLList:=glGenLists(1);
+          GLListsTranslucent[i]:=Value.GLList;
+          glNewList(Value.GLList, GL_COMPILE_AND_EXECUTE);
+          glBegin(GL_QUADS);
+            World.GetBlock(Key.Value).Renderer.Render(Key.Value, Value.Facings);
+          glEnd;
+          glEndList;
+          Data[i]:=Value;
+        end;
+      end;
+      GLListsTranslucentReady:=true;
+    end;
+  end;
 
   glDisable(GL_BLEND);
   glDisable(GL_DEPTH_TEST);
@@ -857,6 +1014,7 @@ end;
 destructor TWorldRenderer.Destroy;
 var
   i: Integer;
+  List: GLuint;
 begin
   try
     with VisibleOpaque do
@@ -868,6 +1026,8 @@ begin
     begin
       for i:=0 to Count - 1 do Keys[i].Value.Destroy;
     end;
+    for List in GLListsOpaque do glDeleteLists(List, 1);
+    for List in GLListsTranslucent do glDeleteLists(List, 1);
     VisibleTranslucent.Destroy;
     if World <> nil then
     begin
@@ -883,52 +1043,6 @@ end;
 
 { Render }
 
-procedure OnResize0(const Sender: TOpenGLControl);
-begin
-  with RenderControlCenter do
-  begin
-    with Sender do
-    begin
-      x:=Left + Width div 2;
-      y:=Top + Height div 2;
-    end;
-  end;
-end;
-procedure Draw0(const Sender: TOpenGLControl);
-var
-  TimeDeltaMills: double;
-begin
-  TimeDeltaMills:=MSecsPerDay * (Now - TimeRenderedDay);
-  TimeRenderedDay:=Now;
-  glClearColor(0.52, 0.80, 0.92, 1.0); // Sky
-  glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT);
-  with ICamera do
-  begin
-    HandleRotateKeyboard(Sender, TimeDeltaMills);
-    UpdateRotation;
-    Move(Sender, TimeDeltaMills);
-    Render(Sender);
-  end;
-  IWorldRenderer.Render;
-  Sender.SwapBuffers;
-end;
-
-{ Control }
-
-procedure KeyDown0(const Sender: TOpenGLControl; var Key: word; const Shift: TShiftState);
-begin
-  case Key of
-    VK_TAB: MouseUncapture(Sender);
-  end;
-  if not (Key in SetKeyRange) then exit;
-  Sender.Refresh;
-  Include(KeysBeingPressed, Key);
-end;
-procedure KeyUp0(const Sender: TOpenGLControl; var Key: word; const Shift: TShiftState);
-begin
-  if not (Key in SetKeyRange) then exit;
-  Exclude(KeysBeingPressed, Key);
-end;
 procedure OnIdle0(const Sender: TOpenGLControl; var Done: boolean);
 var
   Key: word;
@@ -943,37 +1057,133 @@ begin
     end;
   end;
 end;
-procedure OnClick0(const Sender: TOpenGLControl);
+procedure OnResize0(const Sender: TOpenGLControl);
 begin
-  MouseCapture(Sender);
+  with RenderControlCenter do
+  begin
+    with Sender do
+    begin
+      x:=Width div 2;
+      y:=Height div 2;
+    end;
+  end;
+end;
+procedure Draw0(const Sender: TOpenGLControl);
+begin
+  if TryEnterCriticalsection(RTLCriticalSectionLoading) = 1 then
+  begin
+    ProgressBar.Position:=100;
+    TimeDeltaMills:=MSecsPerDay * (Now - TimeRenderedDay);
+    TimeRenderedDay:=Now;
+    glClearColor(0.52, 0.80, 0.92, 1.0); // Sky
+    glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT);
+    with ICamera do
+    begin
+      HandleRotateKeyboard(Sender, TimeDeltaMills);
+      UpdateRotation;
+      Move(Sender, TimeDeltaMills);
+      Render(Sender);
+    end;
+    IWorldRenderer.Render;
+    Sender.SwapBuffers;
+    ProgressBar.Visible:=false;
+    LeaveCriticalSection(RTLCriticalSectionLoading);
+  end;
+end;
+
+{ Control }
+
+procedure Apply1(const Sender: TOpenGLControl; const Size: Longint; const ProgressBarLoading: TProgressBar);
+var
+  Parameters: PApply0Parameters;
+begin
+  ProgressBar:=ProgressBarLoading;
+  ProgressBar.Position:=0;
+  ProgressBar.Visible:=true;
+
+  New(Parameters);
+  Parameters^.Sender:=Sender;
+  Parameters^.Size:=Size;
+  BeginThread(@Apply0, Parameters);
+end;
+function Apply0(Parameter: Pointer): PtrInt;
+var
+  PParameters: PApply0Parameters;
+  Parameters: TApply0Parameters;
+begin
+  PParameters:=PApply0Parameters(Parameter);
+  Parameters:=PParameters^;
+  EnterCriticalSection(RTLCriticalSectionLoading);
+
+  ICamera.Free;
+  IWorld.Free;
+  ProgressBar.Position:=10;
+
+  ICamera:=TCamera.Create;
+  IWorldRenderer:=TWorldRenderer.Create;
+  ProgressBar.Position:=30;
+  IWorld:=TWorld.Create(Parameters.Size, IWorldRenderer);
+  ProgressBar.Position:=50;
+  ICamera.World:=IWorld;
+  IWorldRenderer.World:=IWorld;
+  ProgressBar.Position:=90;
+
+  TimeRenderedDay:=Now;
+  TThread.Synchronize(nil, @Parameters.Sender.Invalidate);
+
+  LeaveCriticalSection(RTLCriticalSectionLoading);
+  Dispose(PParameters);
+  EndThread;
+  exit(0);
+end;
+procedure KeyDown0(const Sender: TOpenGLControl; var Key: word; const Shift: TShiftState);
+begin
+  case Key of
+    VK_ESCAPE: MouseKeyboardUncapture(Sender);
+  end;
+  if not (Key in SetKeyRange) then exit;
+  Sender.Refresh;
+  Include(KeysBeingPressed, Key);
+end;
+procedure KeyUp0(const Sender: TOpenGLControl; var Key: word; const Shift: TShiftState);
+begin
+  if not (Key in SetKeyRange) then exit;
+  Exclude(KeysBeingPressed, Key);
 end;
 procedure OnMouseMove0(const Sender: TOpenGLControl; const Shift: TShiftState; const x, y: Integer);
 begin
-  if MouseCaptured then ICamera.HandleRotateMouse(Sender, Shift, x, y);
+  if MouseKeyboardCaptured then ICamera.HandleRotateMouse(Sender, Shift, x, y);
 end;
-procedure OnMouseLeave0(const Sender: TOpenGLControl);
+procedure OnClick0(const Sender: TOpenGLControl);
 begin
-  if MouseCaptured then MouseUncapture(Sender);
+  if not MouseKeyboardCaptured then MouseKeyboardCapture(Sender);
+end;
+procedure OnExit0(const Sender: TOpenGLControl);
+begin
+  if MouseKeyboardCaptured then MouseKeyboardUncapture(Sender);
 end;
 
-procedure MouseCapture(const Sender: TOpenGLControl);
+procedure MouseKeyboardCapture(const Sender: TOpenGLControl);
 begin
   SetCaptureControl(Sender);
-  MouseCaptured:=true;
+  MouseKeyboardCaptured:=true;
   Mouse.CursorPos:=Sender.ControlToScreen(RenderControlCenter);
   {$IFNDEF Debug}
   Sender.Cursor:=crNone;
   {$ENDIF}
 end;
-procedure MouseUncapture(const Sender: TOpenGLControl);
+procedure MouseKeyboardUncapture(const Sender: TOpenGLControl);
+var
+  Key: word;
 begin
   SetCaptureControl(nil);
-  MouseCaptured:=false;
+  MouseKeyboardCaptured:=false;
   Sender.Cursor:=crDefault;
+  for Key in KeysBeingPressed do Exclude(KeysBeingPressed, Key);
 end;
 
 initialization
-  ICamera:=TCamera.Create;
+  InitCriticalSection(RTLCriticalSectionLoading);
 
   IBlockAirRenderer:=TBlockAirRenderer.Create;
   IBlockAir:=TBlockAir.Create(IBlockAirRenderer);
@@ -985,18 +1195,14 @@ initialization
   IBlockTranslucent:=TBlockTranslucent.Create(IBlockTranslucentRenderer);
   IBlockTranslucentRenderer.Block:=IBlockTranslucent;
 
-  IWorldRenderer:=TWorldRenderer.Create;
-  IWorld:=TWorld.Create(IWorldRenderer);
-  IWorldRenderer.World:=IWorld;
-
-  TimeRenderedDay:=Now;
-
 finalization
   ICamera.Destroy;
   IWorld.Destroy;
   IBlockAir.Destroy;
   IBlockOpaque.Destroy;
   IBlockTranslucent.Destroy;
+
+  DoneCriticalSection(RTLCriticalSectionLoading);
 
 end.
 
