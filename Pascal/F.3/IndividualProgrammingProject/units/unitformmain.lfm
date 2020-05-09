@@ -19,7 +19,7 @@ object FormMain: TFormMain
     OnClick = OpenGLControlRenderClick
     OnKeyDown = OpenGLControlRenderKeyDown
     OnKeyUp = OpenGLControlRenderKeyUp
-    OnMouseEnter = OpenGLControlRenderMouseEnter
+    OnMouseLeave = OpenGLControlRenderMouseLeave
     OnMouseMove = OpenGLControlRenderMouseMove
     OnPaint = OpenGLControlRenderDraw
     OnResize = OpenGLControlRenderResize

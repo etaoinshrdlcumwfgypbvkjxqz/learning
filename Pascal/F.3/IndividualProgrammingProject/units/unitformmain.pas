@@ -22,7 +22,7 @@ type
       procedure ApplicationOnIdle(Sender: TObject; var Done: boolean);
       procedure OpenGLControlRenderClick(const Sender: TOpenGLControl);
       procedure OpenGLControlRenderMouseMove(const Sender: TOpenGLControl; const Shift: TShiftState; const x, y: Integer);
-      procedure OpenGLControlRenderMouseEnter(const Sender: TOpenGLControl);
+      procedure OpenGLControlRenderMouseLeave(const Sender: TOpenGLControl);
   end;
 
 var
@@ -43,8 +43,6 @@ procedure TFormMain.OpenGLControlRenderResize(const Sender: TOpenGLControl);
 begin
   OnResize0(Sender);
 end;
-
-
 procedure TFormMain.OpenGLControlRenderDraw(const Sender: TOpenGLControl);
 begin
   Draw0(Sender);
@@ -68,9 +66,9 @@ procedure TFormMain.OpenGLControlRenderMouseMove(const Sender: TOpenGLControl; c
 begin
   OnMouseMove0(Sender, Shift, x, y);
 end;
-procedure TFormMain.OpenGLControlRenderMouseEnter(const Sender: TOpenGLControl);
+procedure TFormMain.OpenGLControlRenderMouseLeave(const Sender: TOpenGLControl);
 begin
-  OnMouseEnter0(Sender);
+  OnMouseLeave0(Sender);
 end;
 
 end.
