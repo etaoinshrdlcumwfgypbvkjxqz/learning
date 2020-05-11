@@ -8,11 +8,10 @@ interface
 uses
   {$IFDEF UNIX}{$IFDEF UseCThreads}
   cthreads,
-  cmem,
   {$ENDIF}{$ENDIF}
   Classes, SysUtils, Forms,
   LCLType, OpenGLContext, Controls, StdCtrls, ComCtrls,
-  fgl, Matrix, GL, GLU,
+  fgl, Matrix, GL, GLU, MTProcs,
   UnitUtilities;
 
 resourcestring
@@ -48,6 +47,7 @@ type
       function West: TGPosition; virtual;
   end;
   TPositionInteger = specialize TGPosition<Integer>;
+  PPositionInteger = ^TPositionInteger;
 
 type
   TPositionGLdouble = specialize TGPosition<GLdouble>;
@@ -57,7 +57,6 @@ type
   TBlockExist = class;
   TBlockOpaque = class;
   TBlockTranslucent = class;
-  TArrayPositionInteger = array of TPositionInteger;
 
   { Renderer: Forward }
 
@@ -71,32 +70,37 @@ type
 
   { TFPGMapVisibleKey }
 
-  TFPGMapVisibleKey = record
+  TFPGMapVisibleKey = packed record
     Value: TPositionInteger;
     class operator = (const Left, Right: TFPGMapVisibleKey): boolean; overload;
     class operator < (const Left, Right: TFPGMapVisibleKey): boolean; overload;
     class operator > (const Left, Right: TFPGMapVisibleKey): boolean; overload;
   end;
-function CompareTFPGMapVisibleKey(const Left, Right: TFPGMapVisibleKey): Integer;
+  PFPGMapVisibleKey = ^TFPGMapVisibleKey;
 
-type
   { TFPGMapVisibleValue }
 
-  TFPGMapVisibleValue = record
+  TFPGMapVisibleValue = packed class
+    private
+      FGLList: GLuint;
     public
       Facings: TSetEnumFacing;
+      constructor Create;
       function GetCallList: GLuint;
       procedure SetCallList(const list: GLuint);
     private
-      FGLList: GLuint;
       FGLListExists: boolean;
     public
       property GLList: GLuint read GetCallList write SetCallList;
       property GLListExists: boolean read FGLListExists;
   end;
+  PFPGMapVisibleValue = ^TFPGMapVisibleValue;
 
-  TFPGMapVisible = specialize TFPGMap<TFPGMapVisibleKey, TFPGMapVisibleValue>;
+type
+  TFPGMapVisible = specialize TFPGMap<PFPGMapVisibleKey, TFPGMapVisibleValue>;
+function CompareTFPGMapVisibleKey(const PLeft, PRight: PFPGMapVisibleKey): Integer;
 
+type
   { World }
 
   { TBlock }
@@ -159,8 +163,8 @@ type
       function IsValidPosition(const Position: TPositionInteger): boolean; virtual;
       function GetBlock(const Position: TPositionInteger): TBlock; virtual;
       procedure SetBlock(const Position: TPositionInteger; const Block: TBlock); virtual;
-      procedure ForeachBlock(const f: TFunctionWorldForeachBlock; const Arg: Pointer = nil); virtual; overload;
-      procedure ForeachBlock(const f: TFunctionWorldForeachBlockOfObject; const Arg: Pointer = nil); virtual; overload;
+      procedure ForeachBlock(const f: TFunctionWorldForeachBlock; const Concurrent: boolean = false; const Arg: Pointer = nil); virtual; overload;
+      procedure ForeachBlock(const f: TFunctionWorldForeachBlockOfObject; const Concurrent: boolean = false; const Arg: Pointer = nil); virtual; overload;
       procedure ForeachNeighbor(const Position: TPositionInteger; const f: TFunctionBlockForeachNeighbor; const Arg: Pointer = nil); overload;
       procedure ForeachNeighbor(const Position: TPositionInteger; const f: TFunctionBlockForeachNeighborOfObject; const Arg: Pointer = nil); overload;
     protected
@@ -255,7 +259,12 @@ type
       GLListsTranslucent: TArrayGLLists;
       GLListsOpaqueReady: boolean;
       GLListsTranslucentReady: boolean;
+      RTLCriticalSectionVisible: TRTLCriticalSection;
       function InitializeVisible(Block: TBlock; Position: TPositionInteger; Arg: Pointer): TBlock;
+      type TCheckNeighborBlockForVisibleParameters = packed record
+        Value: TFPGMapVisibleValue;
+      end;
+      type PCheckNeighborBlockForVisibleParameters = ^TCheckNeighborBlockForVisibleParameters;
       function CheckNeighborBlockForVisible(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock;
     public
       constructor Create(const World: TWorld = nil);
@@ -270,7 +279,7 @@ type
   TKeyRange = 0..$FF;
   TSetKey = set of TKeyRange;
 
-{ UnitWorld }
+{ UnitGame }
 
 procedure OnIdle0(const Sender: TOpenGLControl; var Done: boolean);
 procedure OnResize0(const Sender: TOpenGLControl);
@@ -279,14 +288,17 @@ procedure Draw0(const Sender: TOpenGLControl);
 { TApply0Parameters }
 
 type
-  TApply0Parameters = record
-    Sender: TOpenGLControl;
+  TApply0Parameters = packed record
     Size: Longint;
+    Sender: TOpenGLControl;
   end;
   PApply0Parameters = ^TApply0Parameters;
 
+{ UnitGame }
+
 procedure Apply1(const Sender: TOpenGLControl; const Size: Longint; const ProgressBarLoading: TProgressBar);
 function Apply0(Parameter: Pointer): PtrInt;
+procedure Apply0LambdaProgressBar(Data: PtrInt);
 procedure KeyDown0(const Sender: TOpenGLControl; var Key: Word; const Shift: TShiftState);
 procedure KeyUp0(const Sender: TOpenGLControl; var Key: Word; const Shift: TShiftState);
 procedure OnClick0(const Sender: TOpenGLControl);
@@ -312,8 +324,8 @@ var
 implementation
 
 var
-  ProgressBar: TProgressBar;
   RTLCriticalSectionLoading: TRTLCriticalSection;
+  ProgressBar: TProgressBar;
 
   RenderControlCenter: TPoint;
   TimeRenderedDay: TDateTime;
@@ -332,13 +344,6 @@ var
   IBlockOpaqueRenderer: TBlockRenderer;
   IBlockTranslucent: TBlock;
   IBlockTranslucentRenderer: TBlockRenderer;
-
-{ UnitWorld }
-
-operator mod(const a, b: double) c: double; inline;
-begin
-  c:=a - b * int(a / b);
-end;
 
 { World }
 
@@ -399,31 +404,35 @@ begin
 end;
 class operator TFPGMapVisibleKey.< (const Left, Right: TFPGMapVisibleKey): boolean;
 var
-  LeftPosition: Tvector3_double;
-  RightPosition: Tvector3_double;
-begin
-  with Left.Value do LeftPosition.Init(x, y, z);
-  with Right.Value do RightPosition.Init(x, y, z);
-  Result:=(LeftPosition - ICamera.Position).Squared_Length > (RightPosition - ICamera.Position).Squared_Length;
-end;
-class operator TFPGMapVisibleKey.> (const Left, Right: TFPGMapVisibleKey): boolean;
-var
-  LeftPosition: Tvector3_double;
-  RightPosition: Tvector3_double;
+  LeftPosition, RightPosition: Tvector3_double;
 begin
   with Left.Value do LeftPosition.Init(x, y, z);
   with Right.Value do RightPosition.Init(x, y, z);
   Result:=(LeftPosition - ICamera.Position).Squared_Length < (RightPosition - ICamera.Position).Squared_Length;
 end;
-function CompareTFPGMapVisibleKey(const Left, Right: TFPGMapVisibleKey): Integer;
+class operator TFPGMapVisibleKey.> (const Left, Right: TFPGMapVisibleKey): boolean;
+var
+  LeftPosition, RightPosition: Tvector3_double;
 begin
-   if Left = Right then exit(0)
-  else if Left < Right then exit(-1)
-  else { if Left > Right then } exit(1);
+  with Left.Value do LeftPosition.Init(x, y, z);
+  with Right.Value do RightPosition.Init(x, y, z);
+  Result:=(LeftPosition - ICamera.Position).Squared_Length > (RightPosition - ICamera.Position).Squared_Length;
+end;
+function CompareTFPGMapVisibleKey(const PLeft, PRight: PFPGMapVisibleKey): Integer;
+begin
+  if PLeft^ = PRight^ then exit(0)
+  else if PLeft^ < PRight^ then exit(1)
+  else { if PLeft^ > PRight^ then } exit(-1);
 end;
 
 { TFPGMapVisibleValue }
 
+constructor TFPGMapVisibleValue.Create;
+begin
+  FGLList:=0;
+  Facings:=[];
+  FGLListExists:=false;
+end;
 function TFPGMapVisibleValue.GetCallList: GLuint;
 begin
   if not GLListExists then raise EAbort.Create(ResStringEIllegal);
@@ -506,7 +515,7 @@ begin
       SetLength(Data[x][y], Size);
     end;
   end;
-  ForeachBlock(@InitializeData);
+  ForeachBlock(@InitializeData, true);
   Self.Renderer:=Renderer;
 end;
 procedure TWorld.SetRenderer(const Renderer: TWorldRenderer);
@@ -546,18 +555,17 @@ begin
     Data[Position.x][Position.y][Position.z]:=Block;
   end;
 end;
-procedure TWorld.ForeachBlock(const f: TFunctionWorldForeachBlock; const Arg: Pointer = nil);
-var
-  x, y, z: Longint;
-  Position: TPositionInteger;
-begin
-  for x:=0 to Size - 1 do
+procedure TWorld.ForeachBlock(const f: TFunctionWorldForeachBlock; const Concurrent: boolean = false; const Arg: Pointer = nil);
+  procedure ForeachBlockLayer(Index: PtrInt; Data: Pointer; Item: TMultiThreadProcItem);
+  var
+    y, z: Longint;
+    Position: TPositionInteger;
   begin
     for y:=0 to Size - 1 do
     begin
       for z:=0 to Size - 1 do
       begin
-        Position:=TPositionInteger.Create(x, y, z);
+        Position:=TPositionInteger.Create(Index, y, z);
         try
           SetBlock(Position, f(GetBlock(Position), Position, Arg));
         finally
@@ -566,19 +574,26 @@ begin
       end;
     end;
   end;
-end;
-procedure TWorld.ForeachBlock(const f: TFunctionWorldForeachBlockOfObject; const Arg: Pointer = nil);
 var
-  x, y, z: Longint;
-  Position: TPositionInteger;
+  x: Longint;
 begin
-  for x:=0 to Size - 1 do
+  if Concurrent then ProcThreadPool.DoParallelLocalProc(@ForeachBlockLayer, 0, Size - 1)
+  else
+  begin
+    for x:=0 to Size - 1 do ForeachBlockLayer(x, nil, nil);
+  end;
+end;
+procedure TWorld.ForeachBlock(const f: TFunctionWorldForeachBlockOfObject; const Concurrent: boolean = false; const Arg: Pointer = nil);
+  procedure ForeachBlockLayer(Index: PtrInt; Data: Pointer; Item: TMultiThreadProcItem);
+  var
+    y, z: Longint;
+    Position: TPositionInteger;
   begin
     for y:=0 to Size - 1 do
     begin
       for z:=0 to Size - 1 do
       begin
-        Position:=TPositionInteger.Create(x, y, z);
+        Position:=TPositionInteger.Create(Index, y, z);
         try
           SetBlock(Position, f(GetBlock(Position), Position, Arg));
         finally
@@ -586,6 +601,14 @@ begin
         end;
       end;
     end;
+  end;
+var
+  x: Longint;
+begin
+  if Concurrent then ProcThreadPool.DoParallelLocalProc(@ForeachBlockLayer, 0, Size - 1)
+  else
+  begin
+    for x:=0 to Size - 1 do ForeachBlockLayer(x, nil, nil);
   end;
 end;
 procedure TWorld.ForeachNeighbor(const Position: TPositionInteger; const f: TFunctionBlockForeachNeighbor; const Arg: Pointer = nil);
@@ -889,42 +912,46 @@ begin
   VisibleOpaque.OnKeyCompare:=@CompareTFPGMapVisibleKey;
   VisibleTranslucent:=TFPGMapVisible.Create;
   VisibleTranslucent.OnKeyCompare:=@CompareTFPGMapVisibleKey;
+  InitCriticalSection(RTLCriticalSectionVisible);
   Self.World:=World;
 end;
 procedure TWorldRenderer.SetWorld(const World: TWorld);
 begin
   if (Self.World <> nil) and (World <> nil) then raise EAbort.Create(ResStringEIllegal);
   FWorld:=World;
-  if Self.World <> nil then Self.World.ForeachBlock(@InitializeVisible);
+  if Self.World <> nil then Self.World.ForeachBlock(@InitializeVisible, true);
 end;
 function TWorldRenderer.InitializeVisible(Block: TBlock; Position: TPositionInteger; Arg: Pointer): TBlock;
 var
+  Parameters: TCheckNeighborBlockForVisibleParameters;
   Visible: TFPGMapVisible;
-  Key: TFPGMapVisibleKey;
-  Index: Integer;
+  PKey: PFPGMapVisibleKey;
 begin
-  if Block.IsOpaque then Visible:=VisibleOpaque
-  else Visible:=VisibleTranslucent;
-  Key.Value:=Position.Clone;
-  Index:=Visible.Add(Key);
-  Visible.Sorted:=false;
-  World.ForeachNeighbor(Position, @CheckNeighborBlockForVisible, @Index);
+  Parameters.Value:=TFPGMapVisibleValue.Create;
+  World.ForeachNeighbor(Position, @CheckNeighborBlockForVisible, @Parameters);
+
+  if not (Longint(Parameters.Value.Facings) = 0) then
+  begin
+    if Block.IsOpaque then Visible:=VisibleOpaque
+    else Visible:=VisibleTranslucent;
+    New(PKey);
+    PKey^.Value:=Position.Clone;
+    EnterCriticalSection(RTLCriticalSectionVisible);
+    Visible.Add(PKey, Parameters.Value);
+    LeaveCriticalSection(RTLCriticalSectionVisible);
+  end
+  else Parameters.Value.Destroy;
+
   exit(Block);
 end;
 function TWorldRenderer.CheckNeighborBlockForVisible(BlockTo, BlockFrom: TBlock; PositionTo, PositionFrom: TPositionInteger; Facing: TEnumFacing; Arg: Pointer): TBlock;
 var
-  Index: PInteger;
-  Visible: TFPGMapVisible;
-  Value: TFPGMapVisibleValue;
+  PParameters: PCheckNeighborBlockForVisibleParameters;
 begin
   if (BlockTo = nil) or (not BlockTo.IsOpaque) then
   begin
-    Index:=PInteger(Arg);
-    if BlockFrom.IsOpaque then Visible:=VisibleOpaque
-    else Visible:=VisibleTranslucent;
-    Value:=Visible.Data[Index^];
-    Include(Value.Facings, Facing);
-    Visible.Data[Index^]:=Value;
+    PParameters:=PCheckNeighborBlockForVisibleParameters(Arg);
+    Include(PParameters^.Value.Facings, Facing);
   end;
   exit(BlockTo);
 end;
@@ -950,11 +977,11 @@ begin
       SetLength(GLListsOpaque, Count);
       for i:=0 to Count - 1 do
       begin
-        Key:=Keys[i];
+        Key:=PFPGMapVisibleKey(Keys[i])^;
         Value:=Data[i];
         if Value.GLListExists then
         begin
-          GLListsTranslucent[i]:=Value.GLList;
+          GLListsOpaque[i]:=Value.GLList;
           glCallList(Value.GLList);
         end
         else
@@ -966,7 +993,6 @@ begin
             World.GetBlock(Key.Value).Renderer.Render(Key.Value, Value.Facings);
           glEnd;
           glEndList;
-          Data[i]:=Value;
         end;
       end;
       GLListsOpaqueReady:=true;
@@ -984,7 +1010,7 @@ begin
       SetLength(GLListsTranslucent, Count);
       for i:=0 to Count - 1 do
       begin
-        Key:=Keys[i];
+        Key:=PFPGMapVisibleKey(Keys[i])^;
         Value:=Data[i];
         if Value.GLListExists then
         begin
@@ -1000,7 +1026,6 @@ begin
             World.GetBlock(Key.Value).Renderer.Render(Key.Value, Value.Facings);
           glEnd;
           glEndList;
-          Data[i]:=Value;
         end;
       end;
       GLListsTranslucentReady:=true;
@@ -1015,20 +1040,34 @@ destructor TWorldRenderer.Destroy;
 var
   i: Integer;
   List: GLuint;
+  PKey_: PFPGMapVisibleKey;
 begin
   try
     with VisibleOpaque do
     begin
-      for i:=0 to Count - 1 do Keys[i].Value.Destroy;
+      for i:=0 to Count - 1 do
+      begin
+        PKey_:=PFPGMapVisibleKey(Keys[i]);
+        PKey_^.Value.Destroy;
+        Dispose(PKey_);
+        Data[i].Destroy;
+      end;
     end;
     VisibleOpaque.Destroy;
     with VisibleTranslucent do
     begin
-      for i:=0 to Count - 1 do Keys[i].Value.Destroy;
+      for i:=0 to Count - 1 do
+      begin
+        PKey_:=PFPGMapVisibleKey(Keys[i]);
+        PKey_^.Value.Destroy;
+        Dispose(PKey_);
+        Data[i].Destroy;
+      end;
     end;
+    VisibleTranslucent.Destroy;
     for List in GLListsOpaque do glDeleteLists(List, 1);
     for List in GLListsTranslucent do glDeleteLists(List, 1);
-    VisibleTranslucent.Destroy;
+    DoneCriticalSection(RTLCriticalSectionVisible);
     if World <> nil then
     begin
       World.Renderer:=nil;
@@ -1039,7 +1078,7 @@ begin
   end;
 end;
 
-{ UnitWorld }
+{ UnitGame }
 
 { Render }
 
@@ -1072,7 +1111,6 @@ procedure Draw0(const Sender: TOpenGLControl);
 begin
   if not (TryEnterCriticalsection(RTLCriticalSectionLoading) = 0) then
   begin
-    ProgressBar.Position:=100;
     TimeDeltaMills:=MSecsPerDay * (Now - TimeRenderedDay);
     TimeRenderedDay:=Now;
     glClearColor(0.52, 0.80, 0.92, 1.0); // Sky
@@ -1095,46 +1133,54 @@ end;
 
 procedure Apply1(const Sender: TOpenGLControl; const Size: Longint; const ProgressBarLoading: TProgressBar);
 var
-  Parameters: PApply0Parameters;
+  PParameters: PApply0Parameters;
 begin
   ProgressBar:=ProgressBarLoading;
   ProgressBar.Position:=0;
   ProgressBar.Visible:=true;
 
-  New(Parameters);
-  Parameters^.Sender:=Sender;
-  Parameters^.Size:=Size;
-  BeginThread(@Apply0, Parameters);
+  New(PParameters);
+  PParameters^.Sender:=Sender;
+  PParameters^.Size:=Size;
+  BeginThread(@Apply0, PParameters);
 end;
 function Apply0(Parameter: Pointer): PtrInt;
 var
   PParameters: PApply0Parameters;
-  Parameters: TApply0Parameters;
+  LambdaProgressBar: TProcedurePointer;
 begin
   PParameters:=PApply0Parameters(Parameter);
-  Parameters:=PParameters^;
-  EnterCriticalSection(RTLCriticalSectionLoading);
+  LambdaProgressBar:=TProcedurePointer.Create(@Apply0LambdaProgressBar);
 
-  ICamera.Free;
-  IWorld.Free;
-  ProgressBar.Position:=10;
+  EnterCriticalSection(RTLCriticalSectionLoading);
+  @ICamera.Free;
+  TThread.Queue(nil, @IWorld.Free); // Avoid GL memory leak
+  Application.QueueAsyncCall(@LambdaProgressBar.Run, 10);
 
   ICamera:=TCamera.Create;
   IWorldRenderer:=TWorldRenderer.Create;
-  ProgressBar.Position:=30;
-  IWorld:=TWorld.Create(Parameters.Size, IWorldRenderer);
-  ProgressBar.Position:=50;
+  Application.QueueAsyncCall(@LambdaProgressBar.Run, 30);
+
+  IWorld:=TWorld.Create(PParameters^.Size, IWorldRenderer);
+  Application.QueueAsyncCall(@LambdaProgressBar.Run, 50);
+
   ICamera.World:=IWorld;
   IWorldRenderer.World:=IWorld;
-  ProgressBar.Position:=90;
+  Application.QueueAsyncCall(@LambdaProgressBar.Run, 90);
 
   TimeRenderedDay:=Now;
-  TThread.Synchronize(nil, @Parameters.Sender.Invalidate);
-
   LeaveCriticalSection(RTLCriticalSectionLoading);
+
+  Application.QueueAsyncCall(@LambdaProgressBar.Run, 100);
+  Application.QueueAsyncCall(@LambdaProgressBar.Destroy, 0);
+  TThread.Queue(nil, @PParameters^.Sender.Invalidate);
   Dispose(PParameters);
   EndThread;
   exit(0);
+end;
+procedure Apply0LambdaProgressBar(Data: PtrInt);
+begin
+  ProgressBar.Position:=Data;
 end;
 procedure KeyDown0(const Sender: TOpenGLControl; var Key: word; const Shift: TShiftState);
 begin
