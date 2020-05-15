@@ -19,8 +19,9 @@ uses
   {$ENDIF}{$ENDIF}
   Classes, SysUtils, Forms,
   LCLType, OpenGLContext, Controls, StdCtrls, ComCtrls,
-  fgl, Matrix, dglOpenGL, MTProcs, Math, GHashSet,
-  UnitUtilities, UnitShaders;
+  fgl, Matrix, dglOpenGL, MTProcs, Math,
+  {$IFDEF Debug}GHashSet,{$ENDIF}
+  UnitFormMain, UnitUtilities, UnitShaders;
 
 resourcestring
   ResStringEUnexpected = 'Unexpected';
@@ -39,10 +40,12 @@ resourcestring
   ResStringOGLError = 'OpenGL Error';
   ResStringOGLErrorHeader = '*** OpenGL Error ***';
   ResStringOGLCallback = 'OpenGL Callback: ';
+  ResStringOGLErrorSource = 'source';
   ResStringOGLErrorType = 'type';
   ResStringOGLErrorId = 'id';
   ResStringOGLErrorSeverity = 'severity';
   ResStringOGLErrorMessage = 'message';
+  ResStringOGLErrorUserParam = 'user param';
 
 type
   { Forward }
@@ -368,12 +371,15 @@ type
 procedure Apply1(const Sender: TOpenGLControl; const Size: Longint; const ProgressBarLoading: TProgressBar);
 function Apply0(Parameter: Pointer): PtrInt;
 procedure Apply0LambdaProgressBar(Data: PtrInt);
-procedure OnCreate0(const Sender: TForm);
+procedure OnCreate0(const Sender: TFormMain);
 procedure KeyDown0(const Sender: TOpenGLControl; var Key: Word; const Shift: TShiftState);
 procedure KeyUp0(const Sender: TOpenGLControl; var Key: Word; const Shift: TShiftState);
 procedure OnClick0(const Sender: TOpenGLControl);
 procedure OnMouseMove0(const Sender: TOpenGLControl; const Shift: TShiftState; const X, Y: Integer);
 procedure OnExit0(const Sender: TOpenGLControl);
+
+procedure OnRendered0(const Sender: TFormMain);
+procedure OnTimer0(const Sender: TFormMain);
 
 procedure MouseKeyboardCapture(const Sender: TOpenGLControl);
 procedure MouseKeyboardUncapture(const Sender: TOpenGLControl);
@@ -398,6 +404,9 @@ const
   CameraMovementPerMills: double = 10 / MSecsPerSec;
   CameraRotationPerPixel: double = 120 / 800;
   CameraRotationPerMills: double = 180 / MSecsPerSec;
+  { Interface }
+  ChartFPSCountMax = 1000;
+  InterfaceInitializedThreshold = 100;
 
 var
   TimeDeltaMills: double = -1;
@@ -406,7 +415,7 @@ implementation
 
 var
   RTLCriticalSectionLoading: TRTLCriticalSection;
-  ProgressBar: TProgressBar;
+  Form: TFormMain;
 
   RenderControlCenter: TPoint;
   TimeRenderedDay: TDateTime;
@@ -426,6 +435,9 @@ var
   IBlockOpaqueRenderer: TBlockRenderer;
   IBlockTranslucent: TBlock;
   IBlockTranslucentRenderer: TBlockRenderer;
+
+  InterfaceInitialized, FrameNumber: int64;
+  FPS, FPSMean, FPSMedian, FPSMax, FPSMin: extended;
 
   {$IFDEF Debug}
   PreviousWarningTypes: THashSetGLenum;
@@ -1242,7 +1254,7 @@ procedure TWorldRenderer.SetWorld(const World: TWorld);
 var
   x, y, z: Longint;
   CoordMax: Longint;
-  PositionTemp, PositionCenterOffset: TGPositionExtended;
+  PositionCenterOffset: TGPositionExtended;
   PositionFrom, PositionTo: TGPositionInteger;
   PKey: PFPGMapPositionExtendedKey;
 begin
@@ -1657,18 +1669,19 @@ end;
 { Render }
 
 procedure OnIdle0(const Sender: TOpenGLControl; var Done: boolean);
-var
-  Key: word;
+{ var
+  Key: word; }
 begin
   Done:=true;
-  for Key in KeysBeingPressed do
+  Sender.Invalidate;
+  { for Key in KeysBeingPressed do
   begin
     if Key in KeysActive then
     begin
       Sender.Invalidate;
       break;
     end;
-  end;
+  end; }
 end;
 procedure OnResize0(const Sender: TOpenGLControl);
 begin
@@ -1687,6 +1700,7 @@ begin
   begin
     TimeDeltaMills:=MSecsPerDay * (Now - TimeRenderedDay);
     TimeRenderedDay:=Now;
+
     glClearColor(0.52, 0.80, 0.92, 1.0); // Sky
     glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT);
     glUseProgram(ProgramShader);
@@ -1699,7 +1713,9 @@ begin
     end;
     IWorldRenderer.Render;
     Sender.SwapBuffers;
-    ProgressBar.Visible:=false;
+
+    OnRendered0(Form);
+
     LeaveCriticalSection(RTLCriticalSectionLoading);
   end;
 end;
@@ -1710,9 +1726,8 @@ procedure Apply1(const Sender: TOpenGLControl; const Size: Longint; const Progre
 var
   PParameters: PApply0Parameters;
 begin
-  ProgressBar:=ProgressBarLoading;
-  ProgressBar.Position:=0;
-  ProgressBar.Visible:=true;
+  Form.ProgressBarLoading.Position:=0;
+  Form.ProgressBarLoading.Visible:=true;
 
   New(PParameters);
   PParameters^.Sender:=Sender;
@@ -1728,6 +1743,7 @@ begin
   LambdaProgressBar:=TProcedurePointer.Create(@Apply0LambdaProgressBar);
 
   EnterCriticalSection(RTLCriticalSectionLoading);
+  InterfaceInitialized:=0;
   ICamera.Free;
   TThread.Queue(nil, @IWorld.Free); // GL memory leak if not so
   Application.QueueAsyncCall(@LambdaProgressBar.Run, 10);
@@ -1749,17 +1765,19 @@ begin
 
   Application.QueueAsyncCall(@LambdaProgressBar.Run, 100);
   Application.QueueAsyncCall(@LambdaProgressBar.Destroy, 0);
-  TThread.Synchronize(nil, @PParameters^.Sender.Invalidate);
+  TThread.Queue(nil, @PParameters^.Sender.Invalidate);
   Dispose(PParameters);
   EndThread;
   exit(0);
 end;
 procedure Apply0LambdaProgressBar(Data: PtrInt);
 begin
-  ProgressBar.Position:=Data;
+  Form.ProgressBarLoading.Position:=Data;
 end;
-procedure OnCreate0(const Sender: TForm);
+procedure OnCreate0(const Sender: TFormMain);
 begin
+  Form:=Sender;
+
   {$IFDEF Debug}
   glEnable(GL_DEBUG_OUTPUT);
   {$IFDEF OpenGLDebugSync}glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);{$ENDIF}
@@ -1806,6 +1824,111 @@ begin
   if MouseKeyboardCaptured then MouseKeyboardUncapture(Sender);
 end;
 
+{ Interface }
+
+procedure OnRendered0(const Sender: TFormMain);
+begin
+  if InterfaceInitialized < InterfaceInitializedThreshold then
+  begin
+    if InterfaceInitialized = 0 then
+    begin
+      FrameNumber:=0;
+      FPS:=MSecsPerSec / TimeDeltaMills;
+      FPSMean:=FPS;
+      FPSMedian:=FPS;
+      FPSMax:=FPS;
+      FPSMin:=FPS;
+
+      with Sender do
+      begin
+        ListChartSourceFPSCurrent.Clear;
+        ListChartSourceFPSMean.Clear;
+        ListChartSourceFPSMedian.Clear;
+        ListChartSourceFPSMax.Clear;
+        ListChartSourceFPSMin.Clear;
+      end;
+    end;
+    Inc(InterfaceInitialized);
+  end
+  else
+  begin
+    Inc(FrameNumber);
+    FPS:=MSecsPerSec / TimeDeltaMills;
+    FPSMean:=FPSMean + (FPS - FPSMean) / FrameNumber;
+    if FPS > FPSMax then FPSMax:=FPS
+    else if FPS < FPSMin then FPSMin:=FPS;
+    FPSMedian:=(FPSMin + FPSMax) / 2;
+
+    with Sender do
+    begin
+      with ListChartSourceFPSCurrent do
+      begin
+        if not IsUpdating then BeginUpdate;
+        Add(FrameNumber, FPS);
+        if Count > ChartFPSCountMax then Delete(0);
+      end;
+      with ListChartSourceFPSMean do
+      begin
+        if not IsUpdating then BeginUpdate;
+        Add(FrameNumber, FPSMean);
+        if Count > ChartFPSCountMax then Delete(0);
+      end;
+      with ListChartSourceFPSMean do
+      begin
+        if not IsUpdating then BeginUpdate;
+        Add(FrameNumber, FPSMean);
+        if Count > ChartFPSCountMax then Delete(0);
+      end;
+      with ListChartSourceFPSMedian do
+      begin
+        if not IsUpdating then BeginUpdate;
+        Add(FrameNumber, FPSMedian);
+        if Count > ChartFPSCountMax then Delete(0);
+      end;
+      with ListChartSourceFPSMax do
+      begin
+        if not IsUpdating then BeginUpdate;
+        Add(FrameNumber, FPSMax);
+        if Count > ChartFPSCountMax then Delete(0);
+      end;
+      with ListChartSourceFPSMin do
+      begin
+        if not IsUpdating then BeginUpdate;
+        Add(FrameNumber, FPSMin);
+        if Count > ChartFPSCountMax then Delete(0);
+      end;
+    end;
+  end;
+
+  Sender.ProgressBarLoading.Visible:=false;
+
+  Sender.LabelFrameNumber.Caption:=ResStringInfoFrameNumberPrefix + IntToStr(FrameNumber);
+end;
+procedure OnTimer0(const Sender: TFormMain);
+begin
+  if InterfaceInitialized >= InterfaceInitializedThreshold then
+  begin
+    with Sender do
+    begin
+      LabelFPS.Caption:=FloatToStrF(FPS, ffNumber, 3, 2) + ResStringInfoFPSCaptionSuffix;
+      LabelMSPF.Caption:=FloatToStrF(TimeDeltaMills, ffNumber, 3, 2) + ResStringInfoMSPFCaptionSuffix;
+
+      LabelFPSCurrent.Caption:=ResStringBenchmarkFPSCurrentCaptionPrefix + FloatToStrF(FPS, ffNumber, 3, 2);
+      LabelFPSMean.Caption:=ResStringBenchmarkFPSMeanCaptionPrefix + FloatToStrF(FPSMean, ffNumber, 3, 2);
+      LabelFPSMedian.Caption:=ResStringBenchmarkFPSMedianCaptionPrefix + FloatToStrF(FPSMedian, ffNumber, 3, 2);
+      LabelFPSMax.Caption:=ResStringBenchmarkFPSMaxCaptionPrefix + FloatToStrF(FPSMax, ffNumber, 3, 2);
+      LabelFPSMin.Caption:=ResStringBenchmarkFPSMinCaptionPrefix + FloatToStrF(FPSMin, ffNumber, 3, 2);
+      ListChartSourceFPSCurrent.EndUpdate;
+      ListChartSourceFPSMean.EndUpdate;
+      ListChartSourceFPSMedian.EndUpdate;
+      ListChartSourceFPSMax.EndUpdate;
+      ListChartSourceFPSMin.EndUpdate;
+    end;
+  end;
+end;
+
+{ Utilities }
+
 procedure MouseKeyboardCapture(const Sender: TOpenGLControl);
 begin
   SetCaptureControl(Sender);
@@ -1846,10 +1969,12 @@ begin
     Flags:=MB_ICONWARNING;
   end;
   S:=ResStringOGLCallback + ErrorString + ' ' +
+     ResStringOGLErrorSource + ' = ' + IntToStr(Source) + ', ' +
      ResStringOGLErrorType + ' = ' + IntToStr(Type_) + ', ' +
      ResStringOGLErrorId + ' = ' + IntToStr(Id) + ', ' +
      ResStringOGLErrorSeverity + ' = ' + IntToStr(Severity) + ', ' +
-     ResStringOGLErrorMessage +' = ' + Message_;
+     ResStringOGLErrorMessage +' = ' + Message_ + ', ' +
+     ResStringOGLErrorUserParam + ' = ' + IntToStr(PtrInt(UserParam));
   Application.MessageBox(PChar(S), PChar(ResStringOGLError), Flags);
 end;
 {$ENDIF}
