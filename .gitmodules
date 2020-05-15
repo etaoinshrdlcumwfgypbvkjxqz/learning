@@ -1,0 +1,3 @@
+[submodule "Pascal/F.3/IndividualProgrammingProject/shaded/dglOpenGL"]
+	path = Pascal/F.3/IndividualProgrammingProject/shaded/dglOpenGL
+	url = https://github.com/SaschaWillems/dglOpenGL.git
