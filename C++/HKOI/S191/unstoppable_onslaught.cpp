@@ -6,7 +6,7 @@
 using namespace std;
 
 namespace s191 {
-    int main(int, char**) {
+    int main(int const, char *const *const) noexcept {
         cout << "abc";
         return 0;
     }
